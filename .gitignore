@@ -1,0 +1,22 @@
+# Mac
+.DS_Store
+
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+# ignore folders for output files
+pickles/
+
+# ignore zipped files
+*.zip
+
+# ignore training data
+*.csv
+
