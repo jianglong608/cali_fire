@@ -1,11 +1,7 @@
 
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sb
 import numpy as np
 from shapely.geometry import Point, LineString, MultiPolygon, asMultiPolygon, Polygon
-from shapely import wkb, wkt
-import shapely
 import geopandas as gpd
 from shapely.ops import unary_union
 import requests
@@ -15,12 +11,11 @@ import os
 import zipfile
 import wget
 from datetime import datetime
-from multiprocessing.dummy import Pool as ThreadPool 
+from multiprocessing.dummy import Pool as ThreadPool
+import folium
+import geocoder
 
-import sys
-from mapping_utility_v2 import map_geopandas, map_AllHouses
-from mapping_utility_fire import map_geopandas_fire
-from python_postgis_talk_utility import transform_pd_to_gpd_general, transform_pd_to_gpd
+from python_postgis_talk_utility import transform_pd_to_gpd
 
 ##########################
 ## geoprocessing functions
@@ -232,4 +227,137 @@ def create_fire_union(gdf, workers=6):
     gdf_union = transform_pd_to_gpd(gdf_union, geometry='geometry')
     
     return gdf_union
+
+
+####################
+# geocoding tools
+####################
+
+
+def geocode(df, api='arcgis', verb=True):
+    data = df.copy()
+    if api == 'arcgis':
+        data.loc[:, 'geocd'] = data['address'].apply(lambda x: geocoder.arcgis(x).latlng)
+    elif api == 'google':
+        data.loc[:, 'geocd'] = data['address'].apply(lambda x: geocoder.google(x).latlng)
+    if verb: print('processing finished: %s' % timer())
+    return data
+
+def multigeocoding(df_geocd, n, workers, api='arcgis', verb=True):
+#     n = 60
+#     workers = 6
+    size = round(df_geocd.shape[0]/n)
+
+    splits = []
+    for i in range(n):
+        if i != n-1:
+            splits.append(df_geocd.iloc[range(size*i, size*(i+1)),])
+        else:
+            splits.append(df_geocd.iloc[size*i:,])
+
+    pool = ThreadPool(workers)
+    temp = pool.map(lambda x: geocode(x, api, verb), splits)
+    final = pd.concat(temp)
+    return final
+
+def multigeocoding_and_repair(df_geocd, n, workers, api='arcgis', verb=True):
+    result = multigeocoding(df_geocd, n, workers, api, verb)
+    success = result[result.geocd.notnull()]
+    fail = result[result.geocd.isnull()]
+    print('%s addresses has failed geocoding! %s' % (fail.shape[0], timer()))
+    # repair failed attempts
+    if fail.shape[0] !=0:
+        repair = geocode(fail, api, verb)
+        print('%s addresses has been repaired! %s' % (repair.geocd.notnull().sum(), timer()))
+        final = pd.concat([success, repair])
+    else:
+        final = result
+    return final
+
+
+
+####################
+# fire mapping tool
+####################
+
+
+def shp_decor(gdf, clabel, fcolor):
+    ckeep = [clabel, 'geometry']
+    gdf = gdf[ckeep]
+    gdf = gdf.assign(style=[{'fillColor': fcolor, 'weight': .5, 'color': 'black'}] * gdf.shape[0])
+    return gdf
+
+
+def add_gdf_tolayer(gdf, lyr_gdf, clabel):
+    # add each geojson row and label in the popup
+    for i in range(gdf.shape[0]):
+        data = gdf.iloc[i:i + 1]
+        geojson = folium.GeoJson(data, smooth_factor=0.01)
+        geojson.add_child(folium.Popup(data[clabel].iloc[0]))
+        geojson.add_to(lyr_gdf)
+    return lyr_gdf
+
+
+def decor_add_gdf_tolayer(gdf, clabel, fcolor, lyr_gdf):
+    gdf = shp_decor(gdf, clabel, fcolor)
+    gdf = add_gdf_tolayer(gdf, lyr_gdf, clabel)
+    return lyr_gdf
+
+
+def create_fire_layer(gdf, mapa, layer_name, poly_label, poly_colr):
+    lyr_fire = folium.FeatureGroup(layer_name)
+    lyr_fire = decor_add_gdf_tolayer(gdf, poly_label, poly_colr, lyr_fire)  # red
+    lyr_fire.add_to(mapa)
+
+
+def create_house_layer(houses, mapa, name):
+    lyr_houses = folium.FeatureGroup(name)
+    cols_house = ['zip', 'address', 'city', 'lat', 'long', 'color']
+    houses = houses[cols_house]
+    #     houses = houses.assign(color=color)
+    radius = 0.5
+    # highlight houses
+    for i in range(houses.shape[0]):
+        house = houses.iloc[i]
+        param = dict(house)
+        folium.CircleMarker(location=(float(house['lat']), float(house['long'])),
+                            radius=radius, color=param['color'], fill_color=param['color']).add_to(lyr_houses)
+    lyr_houses.add_to(mapa)
+
+
+def map_fires(gdfs, zoom_start=8, saveTo=None, saveName=None, saveOnly=False, houses=None):
+    """
+    mapping the polygon in a geopandas file, label the polygon using column clabel.
+    """
+
+    # set up map center and style
+    fire = gdfs['all fires'][0]
+    center_map = fire.centroid.apply(lambda coord: coord.y).median(), fire.centroid.apply(
+        lambda coord: coord.x).median()
+    mapa = folium.Map(location=center_map, tiles=None, zoom_start=zoom_start)
+
+    # create layers for differernt fire polygons
+    for name in gdfs:
+        create_fire_layer(gdfs[name][0], mapa, name, gdfs[name][1], gdfs[name][2])
+
+    # add houses to map
+    if houses is not None:
+        create_house_layer(houses, mapa, 'hve turned off houses')
+
+    # adding layers to map and set up toggler and control
+    folium.TileLayer('OpenStreetMap').add_to(mapa)
+    folium.TileLayer('CartoDBpositron').add_to(mapa)
+    folium.plugins.ScrollZoomToggler().add_to(mapa)
+    folium.LayerControl().add_to(mapa)
+    folium.LatLngPopup().add_to(mapa)
+
+    if saveTo is None:
+        return mapa
+    else:
+        mapa.save("{path}/{file}.html".format(path=saveTo, file=saveName))
+        return IFrame("{path}/{file}.html".format(path=saveTo, file=saveName), width=1000,
+                      height=500) if not saveOnly else None
+
+
+
 
